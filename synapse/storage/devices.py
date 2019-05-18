@@ -1,6 +1,7 @@
 # -*- coding: utf-8 -*-
 # Copyright 2016 OpenMarket Ltd
 # Copyright 2019 New Vector Ltd
+# Copyright 2019 The Matrix.org Foundation C.I.C.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -15,9 +16,11 @@
 # limitations under the License.
 import logging
 
-from six import iteritems, iterkeys, itervalues
+from six import iteritems, itervalues
 
 from canonicaljson import json
+
+from signedjson.key import encode_verify_key_base64
 
 from twisted.internet import defer
 
@@ -25,6 +28,7 @@ from synapse.api.errors import Codes, StoreError
 from synapse.metrics.background_process_metrics import run_as_background_process
 from synapse.storage._base import Cache, SQLBaseStore, db_to_json
 from synapse.storage.background_updates import BackgroundUpdateStore
+from synapse.types import get_verify_key_from_cross_signing_key
 from synapse.util.caches.descriptors import cached, cachedInlineCallbacks, cachedList
 
 logger = logging.getLogger(__name__)
@@ -95,6 +99,7 @@ class DeviceWorkerStore(SQLBaseStore):
 
     def _get_devices_by_remote_txn(self, txn, destination, from_stream_id,
                                    now_stream_id):
+        # get the list of device updates that need to be sent
         sql = """
             SELECT user_id, device_id, max(stream_id) FROM device_lists_outbound_pokes
             WHERE destination = ? AND ? < stream_id AND stream_id <= ? AND sent = ?
@@ -105,17 +110,44 @@ class DeviceWorkerStore(SQLBaseStore):
             sql, (destination, from_stream_id, now_stream_id, False)
         )
 
-        # maps (user_id, device_id) -> stream_id
-        query_map = {(r[0], r[1]): r[2] for r in txn}
-        if not query_map:
-            return (now_stream_id, [])
+        update_list = [r for r in txn]
+
+        # get the cross-signing keys that are in the list
+        users = set(r[0] for r in update_list)
+        master_key_by_user = {}
+        self_signing_key_by_user = {}
+        for user in users:
+            cross_signing_key = self._get_e2e_device_signing_key_txn(txn, user, "master")
+            key_id, verify_key = get_verify_key_from_cross_signing_key(cross_signing_key)
+            master_key_by_user[user] = {
+                "key_info": cross_signing_key,
+                "pubkey": encode_verify_key_base64(verify_key)
+            }
+
+            cross_signing_key = self._get_e2e_device_signing_key_txn(
+                txn, user, "self_signing"
+            )
+            key_id, verify_key = get_verify_key_from_cross_signing_key(cross_signing_key)
+            self_signing_key_by_user[user] = {
+                "key_info": cross_signing_key,
+                "pubkey": encode_verify_key_base64(verify_key)
+            }
+
+        # maps (user_id, device_id) -> stream_id (removing all records
+        # corresponding to cross-signing keys)
+        query_map = {
+            (r[0], r[1]): r[2]
+            for r in update_list
+            if r[1] != master_key_by_user[r[0]]["pubkey"]
+            and r[1] != self_signing_key_by_user[r[0]]["pubkey"]
+        }
 
         if len(query_map) >= 20:
             now_stream_id = max(stream_id for stream_id in itervalues(query_map))
 
         devices = self._get_e2e_device_keys_txn(
             txn, query_map.keys(), include_all_devices=True, include_deleted_devices=True
-        )
+        ) if query_map else {}
 
         prev_sent_id_sql = """
             SELECT coalesce(max(stream_id), 0) as stream_id
@@ -153,25 +185,22 @@ class DeviceWorkerStore(SQLBaseStore):
 
                 results.append(("m.device_list_update", result))
 
-        user_devices = {}
-        for user_id, device_id in iterkeys(query_map):
-            if user_id not in user_devices:
-                user_devices[user_id] = set()
-            user_devices[user_id].add(device_id)
-            set(user_id for (user_id, device_id) in query_map.keys())
-        for user_id, devices in iteritems(user_devices):
-            signing_key = self._get_e2e_device_signing_key_txn(txn, user_id, "self")
-            if not signing_key:
-                continue
-            device_id = None
-            for k in signing_key["keys"].values():
-                device_id = k
-            if device_id in devices:
-                result = {
-                    "user_id": user_id,
-                    "self_signing_key": signing_key
-                }
-                results.append(("m.signing_key_update", result))
+        # figure out which cross-signing keys were changed by intersecting the
+        # update list with the master/self-signing key by user maps
+        cross_signing_keys_by_user = {}
+        for user_id, device_id, stream in update_list:
+            if device_id == master_key_by_user[user_id]["pubkey"]:
+                result = cross_signing_keys_by_user.setdefault(user_id, {})
+                result["master_key"] = \
+                    master_key_by_user[user_id]["key_info"]
+            elif device_id == self_signing_key_by_user[user_id]["pubkey"]:
+                result = cross_signing_keys_by_user.setdefault(user_id, {})
+                result["self_signing_key"] = \
+                    self_signing_key_by_user[user_id]["key_info"]
+
+        for user_id, result in iteritems(cross_signing_keys_by_user):
+            result["user_id"] = user_id
+            results.append(("m.signing_key_update", result))
 
         return (now_stream_id, results)
 

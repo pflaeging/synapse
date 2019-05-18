@@ -1,6 +1,7 @@
 # -*- coding: utf-8 -*-
 # Copyright 2016 OpenMarket Ltd
 # Copyright 2018-2019 New Vector Ltd
+# Copyright 2019 The Matrix.org Foundation C.I.C.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -19,9 +20,7 @@ import logging
 from six import iteritems
 
 from canonicaljson import encode_canonical_json, json
-from signedjson.key import decode_verify_key_bytes, encode_verify_key_base64
 from signedjson.sign import SignatureVerifyException, verify_signed_json
-from unpaddedbase64 import decode_base64
 
 from twisted.internet import defer
 
@@ -31,7 +30,11 @@ from synapse.api.errors import (
     FederationDeniedError,
     SynapseError,
 )
-from synapse.types import UserID, get_domain_from_id
+from synapse.types import (
+    UserID,
+    get_domain_from_id,
+    get_verify_key_from_cross_signing_key,
+)
 from synapse.util.async_helpers import Linearizer
 from synapse.util.caches.expiringcache import ExpiringCache
 from synapse.util.logcontext import make_deferred_yieldable, run_in_background
@@ -142,7 +145,8 @@ class E2eKeysHandler(object):
                 r = remote_queries_not_in_cache.setdefault(domain, {})
                 r[user_id] = remote_queries[user_id]
 
-        self_signing_keys = yield self.query_self_signing_keys(
+        # Get cached cross-signing keys
+        cross_signing_keys = yield self.query_cross_signing_keys(
             device_keys_query, from_user_id
         )
 
@@ -161,9 +165,13 @@ class E2eKeysHandler(object):
                     if user_id in destination_query:
                         results[user_id] = keys
 
+                for user_id, key in remote_result["master_keys"].items():
+                    if user_id in destination_query:
+                        cross_signing_keys["master"][user_id] = key
+
                 for user_id, key in remote_result["self_signing_keys"].items():
                     if user_id in destination_query:
-                        self_signing_keys[user_id] = key
+                        cross_signing_keys["self_signing"][user_id] = key
 
             except Exception as e:
                 failures[destination] = _exception_to_failure(e)
@@ -173,14 +181,18 @@ class E2eKeysHandler(object):
             for destination in remote_queries_not_in_cache
         ], consumeErrors=True))
 
-        defer.returnValue({
+        ret = {
             "device_keys": results, "failures": failures,
-            "self_signing_keys": self_signing_keys,
-        })
+        }
+
+        for key, value in iteritems(cross_signing_keys):
+            ret[key + "_keys"] = value
+
+        defer.returnValue(ret)
 
     @defer.inlineCallbacks
-    def query_self_signing_keys(self, query, from_user_id=None):
-        """Get self-signing keys for users
+    def query_cross_signing_keys(self, query, from_user_id=None):
+        """Get cross-signing keys for users
 
         Args:
             query (dict[string, *]): map from user_id.  This function only looks
@@ -191,25 +203,34 @@ class E2eKeysHandler(object):
                 can see.
 
         Returns:
-            defer.Deferred: (resolves to dict[string, dict]): map from user_id
-                -> self signing key
+            defer.Deferred: (resolves to dict[string, dict[string, dict]]): map from
+                (master|self_signing) -> map from user_id -> master key
         """
+        master_keys = {}
         self_signing_keys = {}
 
         @defer.inlineCallbacks
-        def get_self_signing_key(user_id):
+        def get_cross_signing_key(user_id):
             try:
-                self_signing_keys[user_id] = \
-                    yield self.store.get_e2e_self_signing_key(user_id, from_user_id)
-            except Exception:
+                master_keys[user_id] = yield self.store.get_e2e_cross_signing_key(
+                    user_id, "master", from_user_id
+                )
+            except Exception as e:
+                pass
+
+            try:
+                self_signing_keys[user_id] = yield self.store.get_e2e_cross_signing_key(
+                    user_id, "self_signing", from_user_id
+                )
+            except Exception as e:
                 pass
 
         yield make_deferred_yieldable(defer.gatherResults([
-            run_in_background(get_self_signing_key, user_id)
+            run_in_background(get_cross_signing_key, user_id)
             for user_id in query.keys()
         ]))
 
-        defer.returnValue(self_signing_keys)
+        defer.returnValue({"master": master_keys, "self_signing": self_signing_keys})
 
     @defer.inlineCallbacks
     def query_local_devices(self, query):
@@ -262,12 +283,18 @@ class E2eKeysHandler(object):
         """ Handle a device key query from a federated server
         """
         device_keys_query = query_body.get("device_keys", {})
-        res = yield self.query_local_devices(device_keys_query)
-        self_signing_keys = yield self.query_self_signing_keys(device_keys_query)
-        defer.returnValue({
-            "device_keys": res,
-            "self_signing_keys": self_signing_keys,
-        })
+        device_keys = yield self.query_local_devices(device_keys_query)
+        ret = {
+            "device_keys": device_keys,
+        }
+
+        # add in the cross-signing keys
+        cross_signing_keys = yield self.query_cross_signing_keys(device_keys_query)
+
+        for key, value in iteritems(cross_signing_keys):
+            ret[key + "_keys"] = value
+
+        defer.returnValue(ret)
 
     @defer.inlineCallbacks
     def claim_one_time_keys(self, query, timeout):
@@ -413,112 +440,62 @@ class E2eKeysHandler(object):
             user_id (string): the user uploading the keys
             keys (dict[string, dict]): the signing keys
         """
-        old_self_signing_key = yield self.store.get_e2e_self_signing_key(user_id)
+
+        if "master_key" in keys:
+            master_key = keys["master_key"]
+
+            _check_cross_signing_key(master_key, user_id, "master")
+        else:
+            master_key = yield self.store.get_e2e_cross_signing_key(user_id, "master")
+
+        if not master_key:
+            raise SynapseError(
+                400,
+                "No master key available",
+                Codes.MISSING_PARAM
+            )
+
+        master_key_id, master_verify_key = get_verify_key_from_cross_signing_key(
+            master_key
+        )
 
         if "self_signing_key" in keys:
             self_signing_key = keys["self_signing_key"]
 
-            # basic sanity checking
-            if self_signing_key["user_id"] != user_id \
-               or "self_signing" not in self_signing_key["usage"]:
-                raise SynapseError(
-                    400,
-                    "Invalid self-signing key",
-                    Codes.INVALID_PARAM
-                )
-
-            # if we have a previous self-signing key, make sure that it is
-            # acknowledged, to prevent users from accidentally overwriting a
-            # key (unless they're re-uploading the same key)
-            if old_self_signing_key \
-                    and old_self_signing_key["keys"] != keys["self_signing_key"]["keys"]:
-                if "replaces" not in self_signing_key:
-                    raise SynapseError(
-                        400,
-                        "A self-signing key already exists",
-                        "M_NEEDS_REPLACES"
-                    )
-                old_key_id, old_verify_key \
-                    = _get_verify_key_from_key_info(old_self_signing_key)
-                if self_signing_key["replaces"] != old_key_id.split(':', 1)[1]:
-                    raise SynapseError(
-                        400,
-                        "Incorrect replaces property",
-                        "M_BAD_REPLACES"
-                    )
-
-            # if the key is signed, it must be signed by the old self-signing
-            # key, and we check that it is a valid signature
-            if "signatures" in self_signing_key:
-                if not old_self_signing_key:
-                    raise SynapseError(
-                        400,
-                        "Invalid signature",
-                        Codes.INVALID_SIGNATURE
-                    )
-                old_key_id, old_verify_key \
-                    = _get_verify_key_from_key_info(old_self_signing_key)
-                if user_id not in self_signing_key["signatures"] \
-                   or old_key_id not in self_signing_key["signatures"][user_id]:
-                    raise SynapseError(
-                        400,
-                        "Invalid signature on self-signing key",
-                        Codes.INVALID_SIGNATURE
-                    )
-                try:
-                    verify_signed_json(self_signing_key, user_id, old_verify_key)
-                except SignatureVerifyException:
-                    raise SynapseError(
-                        400,
-                        "Invalid signature on self-signing key",
-                        Codes.INVALID_SIGNATURE
-                    )
-        else:
-            self_signing_key = old_self_signing_key
-
-        key_id, verify_key = _get_verify_key_from_key_info(self_signing_key)
+            _check_cross_signing_key(
+                self_signing_key, user_id, "self_signing", master_verify_key
+            )
 
         if "user_signing_key" in keys:
             user_signing_key = keys["user_signing_key"]
 
-            # basic sanity checking
-            if user_signing_key["user_id"] != user_id \
-               or "user_signing" not in user_signing_key["usage"]:
-                raise SynapseError(
-                    400,
-                    "Invalid user-signing key",
-                    Codes.INVALID_PARAM
-                )
-
-            # the user-signing key must be signed by the current self-signing key
-            if "signatures" not in user_signing_key\
-               or user_id not in user_signing_key["signatures"] \
-               or key_id not in user_signing_key["signatures"][user_id]:
-                raise SynapseError(
-                    400,
-                    "Invalid signature on user-signing key",
-                    Codes.INVALID_SIGNATURE
-                )
-            try:
-                verify_signed_json(user_signing_key, user_id, verify_key)
-            except SignatureVerifyException:
-                raise SynapseError(
-                    400,
-                    "Invalid signature on user-signing key",
-                    Codes.INVALID_SIGNATURE
-                )
+            _check_cross_signing_key(
+                user_signing_key, user_id, "user_signing", master_verify_key
+            )
 
         # if everything checks out, then store the keys and send notifications
         deviceids = []
+        if "master_key" in keys:
+            yield self.store.set_e2e_cross_signing_key(
+                user_id, "master", master_key
+            )
+            deviceids.append(master_verify_key.version)
         if "self_signing_key" in keys:
-            yield self.store.set_e2e_self_signing_key(user_id, self_signing_key)
-            deviceids.append(encode_verify_key_base64(verify_key))
+            yield self.store.set_e2e_cross_signing_key(
+                user_id, "self_signing", self_signing_key
+            )
+            deviceids.append(
+                get_verify_key_from_cross_signing_key(self_signing_key)[1].version
+            )
         if "user_signing_key" in keys:
-            yield self.store.set_e2e_user_signing_key(user_id, user_signing_key)
-            deviceids.append(encode_verify_key_base64(
-                _get_verify_key_from_key_info(user_signing_key)[1])
+            yield self.store.set_e2e_cross_signing_key(
+                user_id, "user_signing", user_signing_key
+            )
+            deviceids.append(
+                get_verify_key_from_cross_signing_key(user_signing_key)[1].version
             )
 
+        # FIXME: usk changes should only notify the user
         if len(deviceids):
             yield self.device_handler.notify_device_update(user_id, deviceids)
 
@@ -555,7 +532,7 @@ class E2eKeysHandler(object):
                     )
 
                 self_signing_key_id, self_signing_verify_key \
-                    = _get_verify_key_from_key_info(self_signing_key)
+                    = get_verify_key_from_cross_signing_key(self_signing_key)
 
                 # fetch our devices so that we can compare with what was sent
                 user_devices = []
@@ -571,64 +548,33 @@ class E2eKeysHandler(object):
                     )
 
                 devices = devices[user_id]
-                for device, key in self_signatures.items():
+                for device_id, device in self_signatures.items():
                     try:
-                        if ("signatures" not in key or user_id not in key["signatures"]
-                                or self_signing_key_id not in key["signatures"][user_id]):
+                        if ("signatures" not in device or
+                                user_id not in device["signatures"] or
+                                self_signing_key_id not in device["signatures"][user_id]):
                             raise SynapseError(
                                 400,
                                 "Invalid signature",
                                 Codes.INVALID_SIGNATURE
                             )
 
-                        signature = key["signatures"][user_id][self_signing_key_id]
-
-                        stored_key = devices[device]["keys"]
-                        if self_signing_key_id in stored_key.get("signatures", {}) \
-                                                            .get(user_id, {}):
+                        stored_device = devices[device_id]["keys"]
+                        if self_signing_key_id in stored_device.get("signatures", {}) \
+                                                               .get(user_id, {}):
                             # we already have the signature, so we can skip it
                             continue
 
-                        # make sure that the key submitted matches what we have stored
-                        del key["signatures"]
-                        if "unsigned" in key:
-                            del key["unsigned"]
-                        if "signatures" in stored_key:
-                            del stored_key["signatures"]
-                        if "unsigned" in stored_key:
-                            del stored_key["unsigned"]
-                        if key != stored_key:
-                            logger.error(
-                                "upload signatures: key does not match %s vs %s",
-                                key, stored_key
-                            )
-                            raise SynapseError(
-                                400,
-                                "Key does not match",
-                                "M_MISMATCHED_KEY"
-                            )
+                        _check_device_signature(
+                            user_id, self_signing_verify_key, device, stored_device
+                        )
 
-                        # verify the signature
-                        key["signatures"] = {
-                            user_id: {
-                                self_signing_key_id: signature
-                            }
-                        }
-                        try:
-                            verify_signed_json(key, user_id, self_signing_verify_key)
-                        except SignatureVerifyException:
-                            logger.error("invalid signature on key")
-                            raise SynapseError(
-                                400,
-                                "Invalid signature",
-                                Codes.INVALID_SIGNATURE
-                            )
-
+                        signature = device["signatures"][user_id][self_signing_key_id]
                         signature_list.append(
-                            (self_signing_key_id, user_id, device, signature)
+                            (self_signing_key_id, user_id, device_id, signature)
                         )
                     except SynapseError as e:
-                        failures.setdefault(user_id, {})[device] \
+                        failures.setdefault(user_id, {})[device_id] \
                             = _exception_to_failure(e)
             except SynapseError as e:
                 failures[user_id] = {
@@ -655,31 +601,31 @@ class E2eKeysHandler(object):
                     }
             else:
                 user_signing_key_id, user_signing_verify_key \
-                    = _get_verify_key_from_key_info(user_signing_key)
+                    = get_verify_key_from_cross_signing_key(user_signing_key)
 
                 for user, devicemap in signatures.items():
-                    device = None
+                    device_id = None
                     try:
-                        # get the user's self-signing key, to make sure it
-                        # matches what was sent
-                        user_key = yield self.store.get_e2e_self_signing_key(
-                            user, user_id
+                        # get the user's master key, to make sure it matches
+                        # what was sent
+                        stored_key = yield self.store.get_e2e_cross_signing_key(
+                            user, "master", user_id
                         )
-                        if user_key is None:
+                        if stored_key is None:
                             logger.error(
                                 "upload signature: no user key found for %s", user
                             )
                             raise SynapseError(
                                 404,
-                                "User's self-signing key not found",
+                                "User's master key not found",
                                 Codes.NOT_FOUND
                             )
 
-                        # make sure that the user's self-signing key is the one
-                        # that was signed
-                        device = _get_verify_key_from_key_info(user_key)[0] \
+                        # make sure that the user's master key is the one that
+                        # was signed
+                        device_id = get_verify_key_from_cross_signing_key(stored_key)[0] \
                             .split(":", 1)[1]
-                        if device not in devicemap:
+                        if device_id not in devicemap:
                             logger.error(
                                 "upload signature: wrong device: %s vs %s",
                                 device, devicemap
@@ -689,10 +635,7 @@ class E2eKeysHandler(object):
                                 "Unknown device",
                                 Codes.NOT_FOUND
                             )
-                        key = devicemap[device]
-                        del devicemap[device]
-
-                        if len(devicemap) > 0:
+                        if len(devicemap) > 1:
                             logger.error("upload signature: too many devices specified")
                             failures[user] = {
                                 device: _exception_to_failure(SynapseError(
@@ -703,73 +646,35 @@ class E2eKeysHandler(object):
                                 for device in devicemap.keys()
                             }
 
-                        # check that we have a signature
-                        if ("signatures" not in key or user_id not in key["signatures"]
-                                or user_signing_key_id not in key["signatures"][user_id]):
-                            logger.error("upload signature: user not found in signatures")
-                            raise SynapseError(
-                                400,
-                                "Invalid signature",
-                                Codes.INVALID_SIGNATURE
-                            )
+                        key = devicemap[device_id]
 
-                        if user_signing_key_id in user_key.get("signatures", {}) \
-                                                          .get(user_id, {}):
+                        if user_signing_key_id in stored_key.get("signatures", {}) \
+                                                            .get(user_id, {}):
                             # we already have the signature, so we can skip it
                             continue
 
+                        _check_device_signature(
+                            user_id, user_signing_verify_key, key, stored_key
+                        )
+
                         signature = key["signatures"][user_id][user_signing_key_id]
-
-                        # make sure that what was submitted matches the key that we have
-                        del key["signatures"]
-                        if "unsigned" in key:
-                            del key["unsigned"]
-                        if "signatures" in user_key:
-                            del user_key["signatures"]
-                        if "unsigned" in user_key:
-                            del user_key["unsigned"]
-                        if key != user_key:
-                            logger.error(
-                                "upload signature: key does not match %s vs %s",
-                                key, user_key
-                            )
-                            raise SynapseError(
-                                400,
-                                "Key does not match",
-                                "M_MISMATCHED_KEY"
-                            )
-
-                        # verify the signature
-                        key["signatures"] = {
-                            user_id: {
-                                user_signing_key_id: signature
-                            }
-                        }
-                        try:
-                            verify_signed_json(key, user_id, user_signing_verify_key)
-                        except SignatureVerifyException:
-                            logger.error("invalid signature on key")
-                            raise SynapseError(
-                                400,
-                                "Invalid signature",
-                                Codes.M_INVALID_SIGNATURE
-                            )
 
                         signed_users.append(user)
                         signature_list.append(
-                            (user_signing_key_id, user, device, signature)
+                            (user_signing_key_id, user, device_id, signature)
                         )
                     except SynapseError as e:
-                        if device is None:
+                        if device_id is None:
                             failures[user] = {
-                                device: _exception_to_failure(e)
-                                for device in devicemap.keys()
+                                device_id: _exception_to_failure(e)
+                                for device_id in devicemap.keys()
                             }
                         else:
-                            failures.setdefault(user, {})[device] \
+                            failures.setdefault(user, {})[device_id] \
                                 = _exception_to_failure(e)
 
         # store the signature, and send the appropriate notifications for sync
+        logger.warning("upload signature failures: %r", failures)
         yield self.store.store_e2e_device_signatures(user_id, signature_list)
 
         if len(self_device_ids):
@@ -780,26 +685,96 @@ class E2eKeysHandler(object):
         defer.returnValue({"failures": failures})
 
 
-def _get_verify_key_from_key_info(key_info):
-    """Get the key ID and signedjson verify key from a cross-signing key dict
+def _check_cross_signing_key(key, user_id, key_type, signing_key=None):
+    """Check a cross-signing key uploaded by a user.  Performs some basic sanity
+    checking, and ensures that it is signed, if a signature is required.
 
     Args:
-        key_info (dict): a cross-signing key dict, which must have a "keys"
-            property that has exactly one item in it
+        key (dict): the key data to verify
+        user_id (str): the user whose key is being checked
+        key_type (str): the type of key that the key should be
+        signing_key (SigningKey): (optional) the signing key that the key should
+            be signed with.  If omitted, signatures will not be checked.
     """
-    if "keys" not in key_info:
+    if "user_id" not in key or key["user_id"] != user_id \
+       or "usage" not in key or key_type not in key["usage"]:
         raise SynapseError(
             400,
-            "Invalid key"
+            ("Invalid %s key" % key_type),
+            Codes.INVALID_PARAM
         )
-    keys = key_info["keys"]
-    if len(keys) != 1:
+
+    if signing_key:
+        try:
+            verify_signed_json(key, user_id, signing_key)
+        except SignatureVerifyException:
+            raise SynapseError(
+                400,
+                ("Invalid signature or %s key" % key_type),
+                Codes.INVALID_SIGNATURE
+            )
+
+
+def _check_device_signature(user_id, verify_key, signed_device, stored_device):
+    """Check that a device signature is correct and matches the copy of the device
+    that we have.  Throws an exception if an error is detected.
+
+    Args:
+        user_id (str): the user ID whose signature is being checked
+        verify_key (str): the key to verify the device with
+        signed_device (dict): the signed device data
+        stored_device (dict): our previous copy of the device
+    """
+
+    key_id = "%s:%s" % (verify_key.alg, verify_key.version)
+
+    # make sure the device is signed
+    if ("signatures" not in signed_device or user_id not in signed_device["signatures"]
+            or key_id not in signed_device["signatures"][user_id]):
+        logger.error("upload signature: user not found in signatures")
         raise SynapseError(
             400,
-            "Invalid key"
+            "Invalid signature",
+            Codes.INVALID_SIGNATURE
         )
-    for key_id, key_data in keys.items():
-        return (key_id, decode_verify_key_bytes(key_id, decode_base64(key_data)))
+
+    signature = signed_device["signatures"][user_id][key_id]
+
+    # make sure that the device submitted matches what we have stored
+    del signed_device["signatures"]
+    if "unsigned" in signed_device:
+        del signed_device["unsigned"]
+    if "signatures" in stored_device:
+        del stored_device["signatures"]
+    if "unsigned" in stored_device:
+        del stored_device["unsigned"]
+    if signed_device != stored_device:
+        logger.error(
+            "upload signatures: key does not match %s vs %s",
+            signed_device, stored_device
+        )
+        raise SynapseError(
+            400,
+            "Key does not match",
+            "M_MISMATCHED_KEY"
+        )
+
+    # check the signature
+    signed_device["signatures"] = {
+        user_id: {
+            key_id: signature
+        }
+    }
+
+    try:
+        verify_signed_json(signed_device, user_id, verify_key)
+    except SignatureVerifyException:
+        logger.error("invalid signature on key")
+        raise SynapseError(
+            400,
+            "Invalid signature",
+            Codes.INVALID_SIGNATURE
+        )
 
 
 def _exception_to_failure(e):
@@ -842,7 +817,6 @@ def _one_time_keys_match(old_key_json, new_key):
 
     return old_key == new_key_copy
 
-
 class SigningKeyEduUpdater(object):
     "Handles incoming signing key updates from federation and updates the DB"
 
@@ -879,7 +853,8 @@ class SigningKeyEduUpdater(object):
         """
 
         user_id = edu_content.pop("user_id")
-        self_signing_key = edu_content.pop("self_signing_key")
+        master_key = edu_content.pop("master_key", None)
+        self_signing_key = edu_content.pop("self_signing_key", None)
 
         if get_domain_from_id(user_id) != origin:
             # TODO: Raise?
@@ -893,7 +868,7 @@ class SigningKeyEduUpdater(object):
             return
 
         self._pending_updates.setdefault(user_id, []).append(
-            (self_signing_key, edu_content)
+            (master_key, self_signing_key, edu_content)
         )
 
         yield self._handle_signing_key_updates(user_id)
@@ -916,12 +891,20 @@ class SigningKeyEduUpdater(object):
 
             device_ids = []
 
-            for self_signing_key, edu_content in pending_updates:
-                yield self.store.set_e2e_self_signing_key(user_id, self_signing_key)
-                device_id = None
-                for k in self_signing_key["keys"].values():
-                    device_id = k
-                if device_id is not None:
+            logger.info("pending updates: %r", pending_updates)
+
+            for master_key, self_signing_key, edu_content in pending_updates:
+                if master_key:
+                    yield self.store.set_e2e_cross_signing_key(
+                        user_id, "master", master_key
+                    )
+                    device_id = get_verify_key_from_cross_signing_key(master_key)[1].version
+                    device_ids.append(device_id)
+                if self_signing_key:
+                    yield self.store.set_e2e_cross_signing_key(
+                        user_id, "self_signing", self_signing_key
+                    )
+                    device_id = get_verify_key_from_cross_signing_key(self_signing_key)[1].version
                     device_ids.append(device_id)
 
             yield device_handler.notify_device_update(user_id, device_ids)

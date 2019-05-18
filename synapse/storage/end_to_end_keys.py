@@ -1,6 +1,7 @@
 # -*- coding: utf-8 -*-
 # Copyright 2015, 2016 OpenMarket Ltd
 # Copyright 2019 New Vector Ltd
+# Copyright 2019 The Matrix.org Foundation C.I.C.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -372,6 +373,20 @@ class EndToEndKeyStore(EndToEndKeyWorkerStore, SQLBaseStore):
             desc="store_master_key"
         )
 
+    def set_e2e_cross_signing_key(self, user_id, key_type, key):
+        """Set a user's cross-signing key.
+
+        Args:
+            user_id (str): the user to set the user-signing key for
+            key_type (str): the type of cross-signing key to set
+            key (dict): the key data
+        """
+        return self.runInteraction(
+            "add_e2e_device_signing_key",
+            self._set_e2e_device_signing_key_txn,
+            user_id, key_type, key
+        )
+
     def set_e2e_user_signing_key(self, user_id, key):
         """Set a user's user-signing key.
 
@@ -382,7 +397,7 @@ class EndToEndKeyStore(EndToEndKeyWorkerStore, SQLBaseStore):
         return self.runInteraction(
             "add_e2e_device_signing_key",
             self._set_e2e_device_signing_key_txn,
-            user_id, "user", key
+            user_id, "user_signing", key
         )
 
     def set_e2e_self_signing_key(self, user_id, key):
@@ -395,7 +410,7 @@ class EndToEndKeyStore(EndToEndKeyWorkerStore, SQLBaseStore):
         return self.runInteraction(
             "add_e2e_device_signing_key",
             self._set_e2e_device_signing_key_txn,
-            user_id, "self", key
+            user_id, "self_signing", key
         )
 
     def _get_e2e_device_signing_key_txn(self, txn, user_id, key_type, from_user_id=None):
@@ -443,6 +458,24 @@ class EndToEndKeyStore(EndToEndKeyWorkerStore, SQLBaseStore):
 
         return key
 
+    def get_e2e_cross_signing_key(self, user_id, key_type, from_user_id=None):
+        """Returns a user's cross-signing key.
+
+        Args:
+            user_id (str): the user whose self-signing key is being requested
+            key_type (str): the type of cross-signing key to get
+            from_user_id (str): if specified, signatures made by this user on
+                the self-signing key will be included in the result
+
+        Returns:
+            dict of the key data
+        """
+        return self.runInteraction(
+            "get_e2e_device_signing_key",
+            self._get_e2e_device_signing_key_txn,
+            user_id, key_type, from_user_id
+        )
+
     def get_e2e_self_signing_key(self, user_id, from_user_id=None):
         """Returns a user's self-signing key.
 
@@ -457,7 +490,7 @@ class EndToEndKeyStore(EndToEndKeyWorkerStore, SQLBaseStore):
         return self.runInteraction(
             "get_e2e_device_signing_key",
             self._get_e2e_device_signing_key_txn,
-            user_id, "self", from_user_id
+            user_id, "self_signing", from_user_id
         )
 
     def get_e2e_user_signing_key(self, user_id, from_user_id=None):
@@ -474,7 +507,7 @@ class EndToEndKeyStore(EndToEndKeyWorkerStore, SQLBaseStore):
         return self.runInteraction(
             "get_e2e_device_signing_key",
             self._get_e2e_device_signing_key_txn,
-            user_id, "user", from_user_id
+            user_id, "user_signing", from_user_id
         )
 
     def store_e2e_device_signatures(self, user_id, signatures):
