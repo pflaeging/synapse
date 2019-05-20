@@ -1,6 +1,7 @@
 # -*- coding: utf-8 -*-
 # Copyright 2016 OpenMarket Ltd
 # Copyright 2019 New Vector Ltd
+# Copyright 2019 The Matrix.org Foundation C.I.C.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -151,14 +152,14 @@ class E2eKeysHandlerTestCase(unittest.TestCase):
         )
 
     @defer.inlineCallbacks
-    def test_replace_self_signing_key(self):
+    def test_replace_master_key(self):
         """uploading a new signing key should make the old signing key unavailable"""
         local_user = "@boris:" + self.hs.hostname
         keys1 = {
-            "self_signing_key": {
+            "master_key": {
                 # private key: 2lonYOM6xYKdEsO+6KrC766xBcHnYnim1x/4LFGF8B0
                 "user_id": local_user,
-                "usage": ["self_signing"],
+                "usage": ["master"],
                 "keys": {
                     "ed25519:nqOvzeuGWT/sRx3h7+MHoInYj3Uk2LD/unI9kDYcHwk":
                     "nqOvzeuGWT/sRx3h7+MHoInYj3Uk2LD/unI9kDYcHwk"
@@ -168,15 +169,14 @@ class E2eKeysHandlerTestCase(unittest.TestCase):
         yield self.handler.upload_signing_keys_for_user(local_user, keys1)
 
         keys2 = {
-            "self_signing_key": {
+            "master_key": {
                 # private key: 4TL4AjRYwDVwD3pqQzcor+ez/euOB1/q78aTJ+czDNs
                 "user_id": local_user,
-                "usage": ["self_signing"],
+                "usage": ["master"],
                 "keys": {
                     "ed25519:Hq6gL+utB4ET+UvD5ci0kgAwsX6qP/zvf8v6OInU5iw":
                     "Hq6gL+utB4ET+UvD5ci0kgAwsX6qP/zvf8v6OInU5iw"
-                },
-                "replaces": "nqOvzeuGWT/sRx3h7+MHoInYj3Uk2LD/unI9kDYcHwk"
+                }
             }
         }
         yield self.handler.upload_signing_keys_for_user(local_user, keys2)
@@ -189,166 +189,27 @@ class E2eKeysHandlerTestCase(unittest.TestCase):
             {
                 "failures": {},
                 "device_keys": {local_user: {}},
-                "self_signing_keys": {
-                    local_user: keys2["self_signing_key"]
-                }
+                "master_keys": {
+                    local_user: keys2["master_key"]
+                },
+                "self_signing_keys": {}
             },
         )
-
-    @defer.inlineCallbacks
-    def test_bad_replace_self_signing_key(self):
-        """replacing a signing key needs to follow rules"""
-        local_user = "@boris:" + self.hs.hostname
-        keys1 = {
-            "self_signing_key": {
-                # private key: 2lonYOM6xYKdEsO+6KrC766xBcHnYnim1x/4LFGF8B0
-                "user_id": local_user,
-                "usage": ["self_signing"],
-                "keys": {
-                    "ed25519:nqOvzeuGWT/sRx3h7+MHoInYj3Uk2LD/unI9kDYcHwk":
-                    "nqOvzeuGWT/sRx3h7+MHoInYj3Uk2LD/unI9kDYcHwk"
-                }
-            }
-        }
-        yield self.handler.upload_signing_keys_for_user(local_user, keys1)
-
-        res = None
-        try:
-            # does not have a "replaces" property
-            keys2 = {
-                "self_signing_key": {
-                    # private key: 4TL4AjRYwDVwD3pqQzcor+ez/euOB1/q78aTJ+czDNs
-                    "user_id": local_user,
-                    "usage": ["self_signing"],
-                    "keys": {
-                        "ed25519:Hq6gL+utB4ET+UvD5ci0kgAwsX6qP/zvf8v6OInU5iw":
-                        "Hq6gL+utB4ET+UvD5ci0kgAwsX6qP/zvf8v6OInU5iw"
-                    },
-                }
-            }
-            yield self.handler.upload_signing_keys_for_user(local_user, keys2)
-        except errors.SynapseError as e:
-            res = e.code
-        self.assertEqual(res, 400)
-
-        res = None
-        try:
-            # has the wrong ID in replaces
-            keys2 = {
-                "self_signing_key": {
-                    # private key: 4TL4AjRYwDVwD3pqQzcor+ez/euOB1/q78aTJ+czDNs
-                    "user_id": local_user,
-                    "usage": ["self_signing"],
-                    "keys": {
-                        "ed25519:Hq6gL+utB4ET+UvD5ci0kgAwsX6qP/zvf8v6OInU5iw":
-                        "Hq6gL+utB4ET+UvD5ci0kgAwsX6qP/zvf8v6OInU5iw"
-                    },
-                    "replaces": "wrong+id"
-                }
-            }
-            yield self.handler.upload_signing_keys_for_user(local_user, keys2)
-        except errors.SynapseError as e:
-            res = e.code
-        self.assertEqual(res, 400)
-
-        res = None
-        try:
-            # invalid signature from old key
-            keys2 = {
-                "self_signing_key": {
-                    # private key: 4TL4AjRYwDVwD3pqQzcor+ez/euOB1/q78aTJ+czDNs
-                    "user_id": local_user,
-                    "usage": ["self_signing"],
-                    "keys": {
-                        "ed25519:Hq6gL+utB4ET+UvD5ci0kgAwsX6qP/zvf8v6OInU5iw":
-                        "Hq6gL+utB4ET+UvD5ci0kgAwsX6qP/zvf8v6OInU5iw"
-                    },
-                    "replaces": "nqOvzeuGWT/sRx3h7+MHoInYj3Uk2LD/unI9kDYcHwk",
-                    "signatures": {
-                        local_user: {
-                            "ed25519:nqOvzeuGWT/sRx3h7+MHoInYj3Uk2LD/unI9kDYcHwk":
-                            "this+is+a+bad+signature"
-                        }
-                    }
-                }
-            }
-            yield self.handler.upload_signing_keys_for_user(local_user, keys2)
-        except errors.SynapseError as e:
-            res = e.code
-        self.assertEqual(res, 400)
-
-    @defer.inlineCallbacks
-    def test_bad_replace_user_signing_key(self):
-        """setting a user signing key needs to follow rules"""
-        local_user = "@boris:" + self.hs.hostname
-        keys1 = {
-            "self_signing_key": {
-                # private key: 2lonYOM6xYKdEsO+6KrC766xBcHnYnim1x/4LFGF8B0
-                "user_id": local_user,
-                "usage": ["self_signing"],
-                "keys": {
-                    "ed25519:nqOvzeuGWT/sRx3h7+MHoInYj3Uk2LD/unI9kDYcHwk":
-                    "nqOvzeuGWT/sRx3h7+MHoInYj3Uk2LD/unI9kDYcHwk"
-                }
-            }
-        }
-        yield self.handler.upload_signing_keys_for_user(local_user, keys1)
-
-        res = None
-        try:
-            # signature from user key
-            keys2 = {
-                "user_signing_key": {
-                    # private key: 4TL4AjRYwDVwD3pqQzcor+ez/euOB1/q78aTJ+czDNs
-                    "user_id": local_user,
-                    "usage": ["user_signing"],
-                    "keys": {
-                        "ed25519:Hq6gL+utB4ET+UvD5ci0kgAwsX6qP/zvf8v6OInU5iw":
-                        "Hq6gL+utB4ET+UvD5ci0kgAwsX6qP/zvf8v6OInU5iw"
-                    },
-                    "signatures": {
-                        local_user: {
-                            "ed25519:nqOvzeuGWT/sRx3h7+MHoInYj3Uk2LD/unI9kDYcHwk":
-                            "this+is+a+bad+signature"
-                        }
-                    }
-                }
-            }
-            yield self.handler.upload_signing_keys_for_user(local_user, keys2)
-        except errors.SynapseError as e:
-            res = e.code
-        self.assertEqual(res, 400)
-
-        res = None
-        try:
-            # invalid signature from user key
-            keys2 = {
-                "user_signing_key": {
-                    # private key: 4TL4AjRYwDVwD3pqQzcor+ez/euOB1/q78aTJ+czDNs
-                    "user_id": local_user,
-                    "usage": ["user_signing"],
-                    "keys": {
-                        "ed25519:Hq6gL+utB4ET+UvD5ci0kgAwsX6qP/zvf8v6OInU5iw":
-                        "Hq6gL+utB4ET+UvD5ci0kgAwsX6qP/zvf8v6OInU5iw"
-                    },
-                    "signatures": {
-                        local_user: {
-                            "ed25519:nqOvzeuGWT/sRx3h7+MHoInYj3Uk2LD/unI9kDYcHwk":
-                            "this+is+a+bad+signature"
-                        }
-                    }
-                }
-            }
-            yield self.handler.upload_signing_keys_for_user(local_user, keys2)
-        except errors.SynapseError as e:
-            res = e.code
-        self.assertEqual(res, 400)
 
     @defer.inlineCallbacks
     def test_reupload_signatures(self):
         """re-uploading a signature should not fail"""
         local_user = "@boris:" + self.hs.hostname
         keys1 = {
+            "master_key": {
+                # private key: HvQBbU+hc2Zr+JP1sE0XwBe1pfZZEYtJNPJLZJtS+F8
+                "user_id": local_user,
+                "usage": ["master"],
+                "keys": {
+                    "ed25519:EmkqvokUn8p+vQAGZitOk4PWjp7Ukp3txV2TbMPEiBQ":
+                    "EmkqvokUn8p+vQAGZitOk4PWjp7Ukp3txV2TbMPEiBQ",
+                }
+            },
             "self_signing_key": {
                 # private key: 2lonYOM6xYKdEsO+6KrC766xBcHnYnim1x/4LFGF8B0
                 "user_id": local_user,
@@ -359,6 +220,11 @@ class E2eKeysHandlerTestCase(unittest.TestCase):
                 }
             }
         }
+        master_signing_key = key.decode_signing_key_base64(
+            "ed25519", "EmkqvokUn8p+vQAGZitOk4PWjp7Ukp3txV2TbMPEiBQ",
+            "HvQBbU+hc2Zr+JP1sE0XwBe1pfZZEYtJNPJLZJtS+F8"
+        )
+        sign.sign_json(keys1["self_signing_key"], local_user, master_signing_key)
         signing_key = key.decode_signing_key_base64(
             "ed25519", "nqOvzeuGWT/sRx3h7+MHoInYj3Uk2LD/unI9kDYcHwk",
             "2lonYOM6xYKdEsO+6KrC766xBcHnYnim1x/4LFGF8B0"
@@ -450,10 +316,10 @@ class E2eKeysHandlerTestCase(unittest.TestCase):
         """signing keys should be hidden when fetching a user's devices"""
         local_user = "@boris:" + self.hs.hostname
         keys1 = {
-            "self_signing_key": {
+            "master_key": {
                 # private key: 2lonYOM6xYKdEsO+6KrC766xBcHnYnim1x/4LFGF8B0
                 "user_id": local_user,
-                "usage": ["self_signing"],
+                "usage": ["master"],
                 "keys": {
                     "ed25519:nqOvzeuGWT/sRx3h7+MHoInYj3Uk2LD/unI9kDYcHwk":
                     "nqOvzeuGWT/sRx3h7+MHoInYj3Uk2LD/unI9kDYcHwk"
