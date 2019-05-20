@@ -424,6 +424,10 @@ class DeviceHandler(DeviceWorkerHandler):
     @defer.inlineCallbacks
     def notify_user_signature_update(self, from_user_id, user_ids):
         """Notify a user that they have made new signatures of other users.
+
+        Args:
+            from_user_id (str): the user who made the signature
+            user_ids (list[str]): the users IDs that have new signatures
         """
 
         position = yield self.store.add_user_signature_change_to_streams(

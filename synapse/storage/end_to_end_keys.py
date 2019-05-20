@@ -334,13 +334,14 @@ class EndToEndKeyStore(EndToEndKeyWorkerStore, SQLBaseStore):
         )
 
     def _set_e2e_device_signing_key_txn(self, txn, user_id, key_type, key):
-        """Set a user's self-signing or user-signing key.
+        """Set a user's cross-signing key.
 
         Args:
             txn (twisted.enterprise.adbapi.Connection): db connection
             user_id (str): the user to set the signing key for
-            key_type (str): the type of key that is being set: either 'self'
-                for a self-signing key, or 'user' for a user-signing key
+            key_type (str): the type of key that is being set: either 'master'
+                for a master key, 'self_signing' for a self-signing key, or
+                'user_signing' for a user-signing key
             key (dict): the key data
         """
         # the cross-signing keys need to occupy the same namespace as devices,
@@ -387,40 +388,15 @@ class EndToEndKeyStore(EndToEndKeyWorkerStore, SQLBaseStore):
             user_id, key_type, key
         )
 
-    def set_e2e_user_signing_key(self, user_id, key):
-        """Set a user's user-signing key.
-
-        Args:
-            user_id (str): the user to set the user-signing key for
-            key (dict): the key data
-        """
-        return self.runInteraction(
-            "add_e2e_device_signing_key",
-            self._set_e2e_device_signing_key_txn,
-            user_id, "user_signing", key
-        )
-
-    def set_e2e_self_signing_key(self, user_id, key):
-        """Set a user's self-signing key.
-
-        Args:
-            user_id (str): the user to set the self-signing key for
-            key (dict): the key data
-        """
-        return self.runInteraction(
-            "add_e2e_device_signing_key",
-            self._set_e2e_device_signing_key_txn,
-            user_id, "self_signing", key
-        )
-
     def _get_e2e_device_signing_key_txn(self, txn, user_id, key_type, from_user_id=None):
-        """Returns a user's self-signing or user-signing key.
+        """Returns a user's cross-signing key.
 
         Args:
             txn (twisted.enterprise.adbapi.Connection): db connection
             user_id (str): the user whose key is being requested
-            key_type (str): the type of key that is being set: either 'self'
-                for a self-signing key, or 'user' for a user-signing key
+            key_type (str): the type of key that is being set: either 'master'
+                for a master key, 'self_signing' for a self-signing key, or
+                'user_signing' for a user-signing key
             from_user_id (str): if specified, signatures made by this user on
                 the key will be included in the result
 
@@ -474,40 +450,6 @@ class EndToEndKeyStore(EndToEndKeyWorkerStore, SQLBaseStore):
             "get_e2e_device_signing_key",
             self._get_e2e_device_signing_key_txn,
             user_id, key_type, from_user_id
-        )
-
-    def get_e2e_self_signing_key(self, user_id, from_user_id=None):
-        """Returns a user's self-signing key.
-
-        Args:
-            user_id (str): the user whose self-signing key is being requested
-            from_user_id (str): if specified, signatures made by this user on
-                the self-signing key will be included in the result
-
-        Returns:
-            dict of the key data
-        """
-        return self.runInteraction(
-            "get_e2e_device_signing_key",
-            self._get_e2e_device_signing_key_txn,
-            user_id, "self_signing", from_user_id
-        )
-
-    def get_e2e_user_signing_key(self, user_id, from_user_id=None):
-        """Returns a user's user-signing key.
-
-        Args:
-            user_id (str): the user whose user-signing key is being requested
-            from_user_id (str): if specified, signatures made by this user on
-                the user-signing key will be included in the result
-
-        Returns:
-            dict of the key data
-        """
-        return self.runInteraction(
-            "get_e2e_device_signing_key",
-            self._get_e2e_device_signing_key_txn,
-            user_id, "user_signing", from_user_id
         )
 
     def store_e2e_device_signatures(self, user_id, signatures):

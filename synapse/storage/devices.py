@@ -20,8 +20,6 @@ from six import iteritems, itervalues
 
 from canonicaljson import json
 
-from signedjson.key import encode_verify_key_base64
-
 from twisted.internet import defer
 
 from synapse.api.errors import Codes, StoreError
@@ -112,7 +110,7 @@ class DeviceWorkerStore(SQLBaseStore):
 
         update_list = [r for r in txn]
 
-        # get the cross-signing keys that are in the list
+        # get the cross-signing keys of the users the list
         users = set(r[0] for r in update_list)
         master_key_by_user = {}
         self_signing_key_by_user = {}
@@ -121,7 +119,7 @@ class DeviceWorkerStore(SQLBaseStore):
             key_id, verify_key = get_verify_key_from_cross_signing_key(cross_signing_key)
             master_key_by_user[user] = {
                 "key_info": cross_signing_key,
-                "pubkey": encode_verify_key_base64(verify_key)
+                "pubkey": verify_key.version
             }
 
             cross_signing_key = self._get_e2e_device_signing_key_txn(
@@ -130,7 +128,7 @@ class DeviceWorkerStore(SQLBaseStore):
             key_id, verify_key = get_verify_key_from_cross_signing_key(cross_signing_key)
             self_signing_key_by_user[user] = {
                 "key_info": cross_signing_key,
-                "pubkey": encode_verify_key_base64(verify_key)
+                "pubkey": verify_key.version
             }
 
         # maps (user_id, device_id) -> stream_id (removing all records
@@ -198,6 +196,7 @@ class DeviceWorkerStore(SQLBaseStore):
                 result["self_signing_key"] = \
                     self_signing_key_by_user[user_id]["key_info"]
 
+        # add the updated cross-signing keys to the results list
         for user_id, result in iteritems(cross_signing_keys_by_user):
             result["user_id"] = user_id
             results.append(("m.signing_key_update", result))
@@ -545,7 +544,7 @@ class DeviceStore(DeviceWorkerStore, BackgroundUpdateStore):
             )
             if not inserted:
                 # if the device already exists, check if it's a real device, or
-                # if the device ID is reserver by something else
+                # if the device ID is reserved by something else
                 hidden = yield self._simple_select_one_onecol(
                     "devices",
                     keyvalues={

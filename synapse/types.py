@@ -479,7 +479,11 @@ def get_verify_key_from_cross_signing_key(key_info):
     Args:
         key_info (dict): a cross-signing key dict, which must have a "keys"
             property that has exactly one item in it
+
+    Returns:
+        (str, VerifyKey): the key ID and verify key for the cross-signing key
     """
+    # make sure that exactly one key is provided
     if "keys" not in key_info:
         raise SynapseError(
             400,
@@ -491,5 +495,6 @@ def get_verify_key_from_cross_signing_key(key_info):
             400,
             "Invalid key"
         )
+    # and return that one key
     for key_id, key_data in keys.items():
         return (key_id, decode_verify_key_bytes(key_id, decode_base64(key_data)))
