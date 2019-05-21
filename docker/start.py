@@ -56,9 +56,9 @@ else:
             "macaroon": "SYNAPSE_MACAROON_SECRET_KEY"
         })
         environ["SYNAPSE_APPSERVICES"] = glob.glob("/data/appservices/*.yaml")
-        if not os.path.exists("/compiled"): os.mkdir("/compiled")
+        if not os.path.exists("/data/compiled"): os.mkdir("/data/compiled")
 
-        config_path = "/compiled/homeserver.yaml"
+        config_path = "/data/compiled/homeserver.yaml"
         
         # Convert SYNAPSE_NO_TLS to boolean if exists
         if "SYNAPSE_NO_TLS" in environ:
@@ -73,8 +73,9 @@ else:
                     sys.exit(2)
 
         convert("/conf/homeserver.yaml", config_path, environ)
-        convert("/conf/log.config", "/compiled/log.config", environ)
-        subprocess.check_output(["chown", "-R", ownership, "/data"])
+        convert("/conf/log.config", "/data/compiled/log.config", environ)
+        if os.getuid() == 0:
+            subprocess.check_output(["chown", "-R", ownership, "/data"])
 
 
     args += [
@@ -86,4 +87,9 @@ else:
 
     # Generate missing keys and start synapse
     subprocess.check_output(args + ["--generate-keys"])
-    os.execv("/sbin/su-exec", ["su-exec", ownership] + args)
+    
+    # only run su-exec as root, otherwise run normal (kubernetes)
+    if os.getuid() == 0:
+        os.execv("/sbin/su-exec", ["su-exec", ownership] + args)
+    else:
+        os.execv("/usr/local/bin/python", args)

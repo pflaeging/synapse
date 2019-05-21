@@ -1,0 +1,48 @@
+apiVersion: extensions/v1beta1
+kind: Deployment
+metadata:
+  annotations:
+    deployment.kubernetes.io/revision: "1"
+  creationTimestamp: null
+  generation: 9
+  labels:
+    net.pflaeging.deployment: chat-stickiebox-synapse
+  name: chat-stickiebox-synapse
+spec:
+  progressDeadlineSeconds: 600
+  replicas: 1
+  revisionHistoryLimit: 10
+  selector:
+    matchLabels:
+      net.pflaeging.deployment: chat-stickiebox-synapse
+  strategy:
+    type: Recreate
+  template:
+    metadata:
+      creationTimestamp: null
+      labels:
+        net.pflaeging.deployment: chat-stickiebox-synapse
+    spec:
+      containers:
+      - envFrom:
+        - configMapRef:
+            name: chat-stickiebox 
+        image: docker-registry.default.svc:5000/chat-stickiebox-org/synapse:v0.99.4-pp6
+        imagePullPolicy: Always
+        name: synapse
+        volumeMounts:
+          - mountPath: /data
+            name: chat-stickiebox-synapse-data
+        resources: {}
+        terminationMessagePath: /dev/termination-log
+        terminationMessagePolicy: File
+      dnsPolicy: ClusterFirst
+      restartPolicy: Always
+      schedulerName: default-scheduler
+      securityContext: {}
+      terminationGracePeriodSeconds: 30
+      volumes:
+        - name: chat-stickiebox-synapse-data
+          persistentVolumeClaim:
+            claimName: chat-stickiebox-synapse-data
+status: {}

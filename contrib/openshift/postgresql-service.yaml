@@ -1,0 +1,20 @@
+apiVersion: v1
+kind: Service
+metadata:
+  creationTimestamp: null
+  labels:
+    net.pflaeging.service: postgresql
+    net.pflaeging.instance: chat-stickiebox
+  name: chat-stickiebox-postgresql
+spec:
+  ports:
+  - name: 5432-tcp
+    port: 5432
+    protocol: TCP
+    targetPort: 5432
+  selector:
+    net.pflaeging.deployment: chat-stickiebox-postgresql
+  sessionAffinity: None
+  type: ClusterIP
+status:
+  loadBalancer: {}

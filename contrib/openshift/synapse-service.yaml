@@ -1,0 +1,20 @@
+apiVersion: v1
+kind: Service
+metadata:
+  creationTimestamp: null
+  labels:
+    net.pflaeging.service: synapse
+    net.pflaeging.instance: chat-stickiebox
+  name: chat-stickiebox-synapse
+spec:
+  ports:
+  - name: 8008-tcp
+    port: 8008
+    protocol: TCP
+    targetPort: 8008
+  selector:
+    net.pflaeging.deployment: chat-stickiebox-synapse
+  sessionAffinity: None
+  type: ClusterIP
+status:
+  loadBalancer: {}

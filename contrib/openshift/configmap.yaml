@@ -1,0 +1,21 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  creationTimestamp: null
+  name: chat-stickiebox
+  labels:
+    net.pflaeging.configmap: synapse
+    net.pflaeging.instance: chat-stickiebox
+data:
+  POSTGRESQL_DATABASE: synapse
+  POSTGRESQL_PASSWORD: yourdbpasswordhere
+  POSTGRESQL_USER: synapse
+  POSTGRES_DB: synapse
+  POSTGRES_HOST: chat-stickiebox-postgresql
+  POSTGRES_PASSWORD: yourdbpasswordhere
+  POSTGRES_USER: synapse
+  SYNAPSE_ENABLE_REGISTRATION: 'yes'
+  SYNAPSE_LOG_LEVEL: WARNING
+  SYNAPSE_NO_TLS: '1'
+  SYNAPSE_REPORT_STATS: 'no'
+  SYNAPSE_SERVER_NAME: chat.server.name.tld
